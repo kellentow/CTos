@@ -1,179 +1,231 @@
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, send_file
 import socket
 import time
 import threading
-import requests
 import os
+import logging
+import utils
+import gc
+
+FLAGS = {"plugins":False}
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,  # Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",  # Log format
+    handlers=[
+        logging.StreamHandler(),  # Output logs to the console
+        logging.FileHandler("main_hub.log", mode="a")  # Optionally log to a file
+    ]
+)
+
+def is_alive(socc: socket.socket):
+    try:
+        # Peek at the socket to check if it's still alive
+        data = socc.recv(16, socket.MSG_DONTWAIT | socket.MSG_PEEK)
+        if len(data) == 0:
+            # If no data is returned, the socket is closed
+            return False
+    except BlockingIOError:
+        # No data available, but the socket is still open
+        return True
+    except ConnectionResetError:
+        # Connection was reset by the peer
+        return False
+    except Exception as e:
+        # Any other exception indicates the socket is not alive
+        print(f"DEBUG: Exception in is_alive: {e}")
+        return False
+    return True
 
 class Device:
-    def __init__(self, ip, name):
-        self.ip = ip
-        self.name = name
-        self.last_ping = time.time()
+    def __init__(self, socket:socket.socket, addr, name:str, parent):
+        self.logger = logging.getLogger(f"Device-{name}")
+        self.parent:MainHub = parent
+        self.socket = socket
+        self.addr = addr
+        self.name:str = name
+        self.logger.info(f"{addr[0]}:{addr[1]} as {name} connected")
+        self.buffer = bytearray()
+        self.packet_buffer:list[bytearray] = []
+        self.lock:threading.Lock=threading.Lock()
+        self.thread:threading.Thread = threading.Thread(target=self.worker,name=name,daemon=True)
+        self.thread.start() #start last to prevent race conditions
 
-    def is_alive(self):
-        return time.time() - self.last_ping < 10
+    def worker(self):
+        while is_alive(self.socket) and not self.parent.shutdown_flag.is_set():
+            payload = None
+            while payload is None:
+                with self.lock:
+                    payload = utils.recv(self.socket)
+                time.sleep(0)
+            self.handle_packet(payload)
+            time.sleep(0)
+        self.logger.info(f"{self.addr[0]}:{self.addr[1]} as {self.name} disconnected")
+        del self.parent.children[self.name]
+        self.socket.close()
+        self = None
+        gc.collect()
+    def handle_packet(self,packet=None):
+        if packet is None:
+            return
+        protocol_handler = self.parent.protocols.get(packet["protocol"])
+        if protocol_handler is not None and FLAGS["plugins"]:
+            new_packet = protocol_handler[0].handle(self,packet)
+            self.parent.send(new_packet)
+        else:
+            self.parent.send(packet)
 
 class MainHub:
-    def __init__(self):
-        self.ip = socket.gethostbyname(socket.gethostname())
-        self.html = Flask(__name__)
+    def __init__(self,website=True,port=5000):
+        self.logger = logging.getLogger("Main Hub")
         self.children = {}
+        self.protocols = {}
         self.device_count = 0
         self.shutdown_flag = threading.Event()
         self.lock = threading.Lock()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(("0.0.0.0",port),socket.TCP_NODELAY)
+        self.ip = self.server_socket.getsockname()[0]
+        self.path = "/"
 
-        # Adding routes
-        self.add_routes()
+        self.server_socket.listen(5)
+        self.server_thread = threading.Thread(target=self.server_handler, daemon=True)
+        self.server_thread.start()
+        if website:
+            # Adding routes
+            self.html = Flask(__name__)
+            self.add_routes()
+        else:
+            self.html = None
+        if FLAGS["plugins"]:
+            self.load_protocols()
+
+    def load_protocols(self):
+        import importlib.util
+        plugins_dir = "./plugins/"
+        for filename in os.listdir(plugins_dir):
+            if not filename.endswith(".py") or filename == "__init__.py":
+                continue
+            module_name = filename[:-3]
+            file_path = os.path.join(plugins_dir, filename)
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    # Validate the module
+                    if hasattr(module, "__protocol__") and hasattr(module, "main"):
+                        protocol_id = module.__protocol__
+                        protocol_version = getattr(module, "__version__", "unknown")
+                        protocol_name = getattr(module, "__name__", "unknown")
+                        if not isinstance(protocol_id, str):
+                            self.logger.error(f"Invalid protocol ID in {filename}: {protocol_id}")
+                            continue
+                        if protocol_id in self.protocols:
+                            self.logger.warning(f"Duplicate protocol ID {protocol_id} in {filename}")
+                            continue
+                        self.protocols[protocol_id] = (module.main(), protocol_version, protocol_name)
+                        self.logger.info(f"Loaded protocol: {protocol_name} (ID: {protocol_id}, Version: {protocol_version})")
+                    else:
+                        self.logger.error(f"Invalid plugin: {filename} (missing __protocol__ or main)")
+            except Exception as e:
+                self.logger.error(f"Failed to load plugin {filename}: {e}")
     
-    def add_routes(self):
-        self.html.add_url_rule('/api/ping', 'ping', self.ping, methods=['POST'])
-        self.html.add_url_rule('/api/add_device', 'add_device', self.add_device_route, methods=['POST'])
-        self.html.add_url_rule('/api/remove_device', 'remove_device', self.remove_device_route, methods=['POST'])
-        self.html.add_url_rule('/api/list', 'list_devices', self.list_devices, methods=['GET'])
-        self.html.add_url_rule('/api/info/', 'get_info', self.hub_info)
-        self.html.add_url_rule('/api/info/<path:variable>', 'dynamic_route', self.dynamic_route)
-        self.html.add_url_rule('/api/shutdown', 'shutdown', self.shutdown, methods=['POST'])
-        self.html.add_url_rule('/', 'index', self.website)
-        self.html.add_url_rule('/<path:variable>', 'website', self.website)
-        self.html.add_url_rule('/api/cmd', 'cmd', self.cmd)
-        self.html.add_url_rule('/html/', 'filelist', self.filelist)
-        self.html.add_url_rule('/html/<path:variable>', 'file', self.html_files)
-
-    def cmd(self):
-        data = request.json
-        cmd = data.get('cmd')
-        a = data.get('from')
-        b = data.get('to')
-        print(f"{a} {cmd} -> {b}")
-        for device in self.children.values():
-            if device.name == a:
-                a_ip = device.ip
-            if device.name == b:
-                b_ip = device.ip
-
-        r = requests.post(f"http://{b_ip}/cmd", json={"cmd": cmd, "from": a_ip})
-        return r.json , r.status_code
-
-    def filelist(self):
-        files = os.listdir("html")
-        return jsonify(files)
-    
-    def website(self, variable=""):
-        if variable == "":
-            variable = "home"
-        if variable.endswith(".html"):
-            variable = variable[:-5]
-        return send_file(f"html/{variable}.html")
-
-    def html_files(self, variable=""):
-        try:
-            if not variable.startswith("html/"):
-                file_path = os.path.join("html", variable)
-            else:
-                file_path = os.path.join("html", variable[5:])
-            if not os.path.isfile(file_path):
-                raise FileNotFoundError
-            return send_file(file_path)
-        except FileNotFoundError:
-            return "file not found", 404
-
-    def check_ping(self):
+    def server_handler(self):
         while not self.shutdown_flag.is_set():
-            with self.lock:
-                for name, child in list(self.children.items()):
-                    if not child.is_alive():
-                        self.children.pop(name)
-                        print(f"Removed {name} from the list of children")
-            time.sleep(10)
+            try:
+                client_socket, client_address = self.server_socket.accept()
+                client_socket.settimeout(2)  # Set a timeout so handshake doesn't last too long
+            except OSError:
+                self.logger.error("OSError while accepting connection")
+                continue
+            try:
+                length_byte = client_socket.recv(1)
+                if length_byte == b"":
+                    client_socket.close() #bad thing happened, make them try again
+                else:
+                    length = int.from_bytes(length_byte,"big",signed=False)
+                    name = client_socket.recv(length).decode("ascii")
+                    client_path = f"{self.path}/{name}".replace("//","/")
+                    client_socket.send(len(client_path).to_bytes(length=4,byteorder="big")) #up to 16711935 devices in a path
+                    client_socket.send(client_path.encode("ascii"))
+                    client_socket.settimeout(None)
+                    self.children[name] = Device(client_socket,client_address,name,self)
+            except socket.timeout:
+                self.logger.info("Socket timeout while waiting for client data")
+                client_socket.close()
+                continue
 
-    def add_device(self, name, ip):
-        with self.lock:
-            self.children[name] = Device(ip, name)
-            return "Device added successfully"
-        
-    def hub_info(self):
-        print(f"Hub info requested")
-        return jsonify({
-            "ip": self.ip,
-            "children": [child.name for child in self.children.values()]
-        })
+    def send(self,data=None):
+        if data is None:
+            return #Protocol stopped data transfer or data was invalid
+        dest = data["dest"]
+        frm = data["from"]
     
-    def dynamic_route(self, variable=""):
-        args = variable.split("/")
-        print(f"{args}'s Info requested")
-        parent = self
-        try:
-            for arg in args:
-                parent = parent.children[arg]
-            if "children" in parent.__dict__:
-                return jsonify({"ip": parent.ip, "name": parent.name, "children": [child.name for child in parent.children.values()]})
-            else:
-                return jsonify({"ip": parent.ip, "name": parent.name})
-        except KeyError:
-            print(f"Invalid path")
-            return "Invalid path", 500
-        except Exception as e:
-            print(f"Something went wrong: {e}")
-            return "Something went wrong", 500
+        # Remove the hub's path prefix from the destination path
+        if dest.startswith(self.path):
+            rel_path = dest[len(self.path):].lstrip("/")
+        else:
+            rel_path = "../" # in future handle relative paths
 
-    def remove_device(self, name):
-        with self.lock:
-            if name in self.children:
-                self.children.pop(name)
-                return "Device removed successfully"
-            else:
-                return "Device does not exist", 500
-
-    def list_devices(self):
-        with self.lock:
-            return jsonify({name: device.ip for name, device in self.children.items()})
-
-    def add_device_route(self):
-        data = request.json
-        name = data.get('name')
-        ip = data.get('ip')
-        return self.add_device(name, ip)
-
-    def remove_device_route(self):
-        data = request.json
-        name = data.get('name')
-        return self.remove_device(name)
-
-    def ping(self):
-        data = request.json
-        name = data.get('name')
-        ip = data.get('ip')
-        print(f"Received ping from {name}")
-        with self.lock:
-            if name not in self.children:
-                self.children[name] = Device(ip, name)
-            self.children[name].last_ping = time.time()
-            return "pong"
+        # The next hop is the first component of the relative path
+        next_dest = rel_path.split("/", 1)[0] if rel_path else "../"
+        
+        if next_dest != "../":
+            print(f"{frm} -> {self.path} -> {dest}")
+            if next_dest not in self.children:
+                return print(f"{next_dest} is not a child of {self.path}")
             
+            dest:Device = self.children[next_dest]
+            with dest.lock:
+                utils.send(dest.socket,data)
+        else:
+            parent_path = "/".join(self.path.split("/")[:-1])
+            print(f"{frm} -> {self.path} -> {parent_path}")
+            return "../"
+
+    def add_routes(self):
+        def website(variable=""):
+            if variable == "":
+                variable = "home"
+            if variable.endswith(".html"):
+                variable = variable[:-5]
+            return send_file(f"html/{variable}.html")
+
+        def html_files(variable=""):
+            try:
+                if not variable.startswith("html/"):
+                    file_path = os.path.join("html", variable)
+                else:
+                    file_path = os.path.join("html", variable[5:])
+                if not os.path.isfile(file_path):
+                    raise FileNotFoundError
+                return send_file(file_path)
+            except FileNotFoundError:
+                return "file not found", 404
+        self.html.add_url_rule('/', 'index', website)
+        self.html.add_url_rule('/<path:variable>', 'website', website)
+        self.html.add_url_rule('/html/<path:variable>', 'file', html_files)
+
+    def run(self,port=8000):
+        if self.html is not None:
+            self.html.run(host='0.0.0.0', port=port)
 
     def shutdown(self):
         self.shutdown_flag.set()
-        shutdown_thread = threading.Thread(target=request.environ.get('werkzeug.server.shutdown'))
-        shutdown_thread.start()
-        return "Shutting down..."
-
-    def run(self):
-        threading.Thread(target=self.check_ping).start()
-        self.html.run(host='0.0.0.0', port=8000)
+        self.server_thread.join()
+        for child in self.children:
+            with child.lock:
+                child.thread.join()
 
 if __name__ == '__main__':
     main_hub = MainHub()
-    threading.Thread(target=main_hub.run).start()
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
+        main_hub.run()
     except Exception as e:
-        print(e)
-    finally:
-        print("Shutting down...")
-        # Stop MainHub
-        requests.post("http://127.0.0.1:8000/shutdown")
-        exit()
+        e.with_traceback()
+    print("Shutting down...")
+    main_hub.shutdown()
+    exit()
