@@ -2,12 +2,16 @@ from flask import Flask, send_file
 import socket
 import time
 import threading
-import os
+import os, sys
 import logging
 import utils
 import gc
 
 FLAGS = {"plugins":False}
+
+if utils.is_admin() and os.name == "posix":
+    os.system("sudo ulimit -n 65535") #more fd-s
+    os.system("sudo taskset -c 2 python3 Hub.py") #main on 1 core but it gets the entire core
 
 # Configure logging
 logging.basicConfig(
@@ -46,26 +50,36 @@ class Device:
         self.addr = addr
         self.name:str = name
         self.logger.info(f"{addr[0]}:{addr[1]} as {name} connected")
-        self.buffer = bytearray()
-        self.packet_buffer:list[bytearray] = []
+        self.recv_buffer:list[dict] = []
+        self.send_buffer:list[dict] = []
         self.lock:threading.Lock=threading.Lock()
         self.thread:threading.Thread = threading.Thread(target=self.worker,name=name,daemon=True)
         self.thread.start() #start last to prevent race conditions
 
     def worker(self):
-        while is_alive(self.socket) and not self.parent.shutdown_flag.is_set():
-            payload = None
-            while payload is None:
-                with self.lock:
-                    payload = utils.recv(self.socket)
-                time.sleep(0)
-            self.handle_packet(payload)
-            time.sleep(0)
-        self.logger.info(f"{self.addr[0]}:{self.addr[1]} as {self.name} disconnected")
-        del self.parent.children[self.name]
+        try:
+            while is_alive(self.socket) and not self.parent.shutdown_flag.is_set():
+                payload = "a"
+                while payload is not None:
+                    with self.lock:
+                        payload = utils.recv(self.socket)
+                        if payload is not None:
+                            self.recv_buffer.append(payload)
+
+                        if len(self.send_buffer) > 0:
+                            for packet in self.send_buffer:
+                                utils.send(self.socket,packet)
+                    time.sleep(0)
+                for packet in self.recv_buffer:
+                    self.handle_packet(packet)
+        except Exception as e:
+            self.logger.error(f"Exception in worker: {e}")
+        finally:
+            self.logger.info(f"{self.addr[0]}:{self.addr[1]} as {self.name} disconnected")
+    
+    def __del__(self):
         self.socket.close()
         self = None
-        gc.collect()
     def handle_packet(self,packet=None):
         if packet is None:
             return
@@ -86,13 +100,16 @@ class MainHub:
         self.lock = threading.Lock()
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind(("0.0.0.0",port),socket.TCP_NODELAY)
+        self.server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024*1024)
+        self.server_socket.bind(("0.0.0.0",port))
         self.ip = self.server_socket.getsockname()[0]
         self.path = "/"
 
         self.server_socket.listen(5)
         self.server_thread = threading.Thread(target=self.server_handler, daemon=True)
-        self.server_thread.start()
         if website:
             # Adding routes
             self.html = Flask(__name__)
@@ -135,6 +152,10 @@ class MainHub:
     
     def server_handler(self):
         while not self.shutdown_flag.is_set():
+            for name in list(self.children.keys()):
+                device = self.children[name]
+                if not is_alive(device.socket):
+                    self.children.pop(name)
             try:
                 client_socket, client_address = self.server_socket.accept()
                 client_socket.settimeout(2)  # Set a timeout so handshake doesn't last too long
@@ -179,8 +200,7 @@ class MainHub:
                 return print(f"{next_dest} is not a child of {self.path}")
             
             dest:Device = self.children[next_dest]
-            with dest.lock:
-                utils.send(dest.socket,data)
+            dest.send_buffer.append(data)
         else:
             parent_path = "/".join(self.path.split("/")[:-1])
             print(f"{frm} -> {self.path} -> {parent_path}")
@@ -212,6 +232,7 @@ class MainHub:
     def run(self,port=8000):
         if self.html is not None:
             self.html.run(host='0.0.0.0', port=port)
+        self.server_thread.start()
 
     def shutdown(self):
         self.shutdown_flag.set()

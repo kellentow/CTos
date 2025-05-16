@@ -1,9 +1,16 @@
-import json,socket
+import ujson,socket,sys,os,ctypes
+
+def is_admin() -> bool:
+    if sys.platform.startswith("linux") and os.geteuid() == 0: #Linux
+        return True
+    elif sys.platform=="win32" and ctypes.windll.shell32.IsUserAnAdmin() != 0: #Windows
+        return True
+    return False
 
 def coder(data, encode=True) -> bytes:
     if encode:
         try:
-            packet = json.dumps(data)
+            packet = ujson.dumps(data)
         except Exception as e:
             raise TypeError("Could not encode packet") from e
         packet = packet.encode("utf-8")
@@ -12,9 +19,9 @@ def coder(data, encode=True) -> bytes:
     else:
         try:
             packet = data.decode("utf-8")
-            packet = json.loads(packet)
+            packet = ujson.loads(packet)
             return packet
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        except (UnicodeDecodeError, ujson.JSONDecodeError) as e:
             print(f"Error decoding packet: {e}")
             return None
 
@@ -32,14 +39,13 @@ def recv(conn: socket.socket):
         data_len = int.from_bytes(len_bytes, "big")
         if data_len == 0:
             return None # No data to read
-        else:
-            received = b""
-            while len(received) < data_len:
-                chunk = conn.recv(data_len - len(received))
-                if not chunk:
-                    return None  # Socket closed unexpectedly
+        received = b""
+        while len(received) < data_len:
+            if chunk := conn.recv(data_len - len(received)):
                 received += chunk
-            packet = received  
+            else:
+                return None  # Socket closed unexpectedly
+        packet = received
     except (OSError, socket.timeout):
         conn.settimeout(None)
         return None  # No data available or timeout

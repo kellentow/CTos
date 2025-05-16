@@ -21,7 +21,7 @@ def bytes_to_readable(bytes:int):
             return f"{bytes / cur:.2f}{item}"
         cur *= dif
 
-payload = {"protocol":0,"payload":"Test","dest":"/Test_reciever"}
+payload = {"protocol":0,"payload":"","dest":"/Test_reciever"}
 client1 = Client("Test_sender",parent=("192.168.1.168",5000))
 client2 = Client("Test_reciever",parent=("192.168.1.168",5000))
 time.sleep(0.1)
@@ -40,7 +40,7 @@ for i in range(packets):
         got=client2.recv()
     if trys >= max_trys:
         fails +=1
-        print(f"\n{i}: Message ot recieved properly\n")
+        print(f"\n{i}: Message not recieved properly\n")
     else:
         l = time.time()-start
         latency[0] = min(latency[0] ,l)

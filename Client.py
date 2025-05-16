@@ -1,8 +1,4 @@
-import contextlib
-import socket
-import threading
-import time
-import utils
+import contextlib,socket,threading,time,utils
 
 def is_alive(conn: socket.socket): #https://stackoverflow.com/a/62277798 thank youuuuuuu
     try:
@@ -27,6 +23,7 @@ class Client:
         self.lock:threading.Lock=threading.Lock()
         self.buffer:list = []
         self.parent_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.parent_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.thread:threading.Thread = threading.Thread(target=self.check_ping, daemon=True)
         self.thread.start()
         self.path = "/"
@@ -64,8 +61,7 @@ class Client:
         Send a packet to the parent socket.
 
         Args:
-            is_header (bool): Whether this is a header packet.
-            packet (dict or list): The packet data. will be encoded as JSON (ASCII).
+            packet (dict or list): The packet data. will be encoded as JSON (UTF-8).
 
         Raises:
             TypeError: If packet is not JSON encodable.
